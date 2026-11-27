@@ -1,8 +1,13 @@
-"""变更签证领域服务：签认签证后直接更新施工排期里程碑和费用联动。"""
+"""变更签证领域服务：签认签证后直接更新施工排期里程碑和费用联动。
+
+签证的费用增减、签认版本与费用调整台账同步到持久化账簿；
+核准/冲减结果回写到签证的「费用调整台账」字段，旧查询接口可直接核对。
+"""
 from __future__ import annotations
 
 from typing import Any
 
+from app.ledger import ANN_ADJ_LEDGER, ANN_ADJ_NET, ledger
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -11,11 +16,51 @@ class ChangeOrderService(BaseModuleService):
     MODULE = "change_order"
     ENTITY = "变更签证单"
     OPERATION_TERM = "提出变更"
-    LIST_FIELDS = ["变更事项", "变更原因", "影响工序", "费用增减", "提出人", "审批人", "签认日期", "备注说明"]
+    LIST_FIELDS = [
+        "变更事项", "变更原因", "影响工序", "费用增减", "提出人", "审批人",
+        "签认日期", "备注说明", "费用调整台账", "费用调整净额",
+    ]
     REQUIRED_FIELDS = ["变更事项", "变更原因", "影响工序"]
     STATUS_ORDER = ["待提出", "已提出", "已签认", "已驳回"]
     ACTION_RULES = {"提出变更": "已提出", "签认变更": "已签认", "驳回变更": "已驳回"}
     NEGATIVE_ACTIONS = ["驳回变更"]
+
+    def _ensure_ledger(self) -> None:
+        ledger.ensure_migrated(store)
+
+    def list_entries(self, *args: Any, **kwargs: Any):
+        self._ensure_ledger()
+        return super().list_entries(*args, **kwargs)
+
+    def get_entry(self, entry_id: int) -> dict[str, Any] | None:
+        self._ensure_ledger()
+        entry = super().get_entry(entry_id)
+        if entry is not None and ledger.is_active():
+            # 旧接口 GET 单条签证也能看到最新费用调整台账与净额
+            ledger.adjustment_ledger(entry_id)
+        return entry
+
+    def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+        self._ensure_ledger()
+        entry, missing = super().create_entry(values)
+        if entry is not None:
+            ledger.sync_change_upsert(entry)
+        return entry, missing
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        self._ensure_ledger()
+        before = store.find(self.MODULE, entry_id)
+        status_from = before.get("status", "") if before else ""
+        funding_before = {int(r["id"]) for r in store.rows("funding_use")}
+
+        entry, message = super().run_action(entry_id, action)
+        if entry is not None and entry.get("status") != status_from:
+            # 仅在状态真正流转时追加版本；幂等短路的重复请求不产生新版本
+            new_funding = [
+                r for r in store.rows("funding_use") if int(r["id"]) not in funding_before
+            ]
+            ledger.sync_change_action(entry, action, status_from, new_funding)
+        return entry, message
 
     def cross_module_verify(
         self, entry_id: int, action: str, entry: dict[str, Any]
@@ -74,6 +119,8 @@ class ChangeOrderService(BaseModuleService):
                     "经办人": entry.get("审批人", ""),
                     "审批状态": "变更费用",
                     "备注说明": f"由变更签证#{entry_id}自动触发",
+                    "关联签证": entry_id,
+                    "关联工序": process,
                     "status": "待提交",
                     "pending": True,
                     "abnormal": False,
@@ -87,3 +134,10 @@ class ChangeOrderService(BaseModuleService):
                     ws_row["abnormal"] = True
                     effects.append(dict(ws_row))
         return effects
+
+    def domain_snapshot(self) -> dict[str, Any]:
+        snapshot = super().domain_snapshot()
+        totals = ledger.totals(store)
+        snapshot["finance_totals"] = totals
+        snapshot["fee_adjustment_fields"] = [ANN_ADJ_LEDGER, ANN_ADJ_NET]
+        return snapshot

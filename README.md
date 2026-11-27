@@ -77,5 +77,41 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 持久化财务账簿（修缮支出 / 变更签证）
+
+`backend/app/ledger.py` 把修缮支出（`funding_use`）与变更签证（`change_order`）的
+核准费用迁移到带历史版本的 SQLite 持久化账簿，默认库文件
+`backend/data/finance_ledger.sqlite3`（可用环境变量 `LEDGER_PATH` 覆盖，
+`LEDGER_AUTO_MIGRATE=0` 关闭首次访问自动迁移）。
+
+- **旧接口不变**：`/api/funding_use`、`/api/change_order` 的登记、提交、核准、驳回、
+  签认、查询契约保持原样；新增字段（`关联签证`、`原支出`、`关联工序`、`凭据类型`、
+  `费用调整台账`、`费用调整净额`）均为可选项。
+- **历史版本**：每条分录在 `ledger_entry_versions` 留全量版本（登记/提交/核准/驳回/冲减），
+  金额以整数分存储、Decimal 换算，净额持久化前后精确到分。
+- **重复引用去重**：存量中重复引用同一张签证同一笔款项的记录，最早一条计为实际款项，
+  其余标注 `重复引用` 与原因、保留可追溯明细，不重复计入净额。
+- **退款冲减**：退款（负金额/退款类别/绑定 `原支出`）与原支出对应，核准即确认冲减；
+  迁移与核准并发交叠时，凭流水唯一键 `approve:funding:<id>` 只确认一次，重放也不重复。
+- **费用调整台账**：核准、冲减、驳回结果回写到对应变更签证的 `费用调整台账` 字段，
+  旧接口 GET 签证即可核对累计净额。
+- **迁移与回滚**：`POST /api/finance/ledger/migrate` 可重复执行（断点续迁、不重复入账）；
+  `POST /api/finance/ledger/rollback` 切回内存读源，账簿数据与冲减流水全部保留，
+  回滚后冲减不凭空消失、也不重复计。
+
+新增的账簿管理/核对接口（前缀 `/api/finance`，注册在通用 `/api/{module}` 之前）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/finance/ledger/status` | 账簿模式、分录/版本/流水用量、迁移历史 |
+| POST | `/api/finance/ledger/migrate` | 显式迁移（幂等，可在回滚后重新切换） |
+| POST | `/api/finance/ledger/rollback` | 回滚迁移，保留账簿数据 |
+| GET | `/api/finance/totals` | 有效凭据、重复引用、退款冲减与净额 |
+| GET | `/api/finance/{module}/{id}/versions` | 某条支出/签证的历史版本 |
+| GET | `/api/finance/change-orders/{id}/adjustments` | 签证费用调整台账与累计净额 |
+
+相关测试：`backend/tests/test_finance_ledger.py`（去重、小数退款、并发冲减幂等、
+回滚不丢不重、180.40 元人工支出 + 43.25 元退款试运行）。
+
 领域：应用开发
 子方向：web前端/全栈开发
